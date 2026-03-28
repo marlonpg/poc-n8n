@@ -1,0 +1,368 @@
+{
+  "name": "Incident Triage Automation",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [{ "field": "minutes", "minutesInterval": 5 }]
+        }
+      },
+      "id": "trigger-schedule",
+      "name": "Every 5 Minutes",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [0, 300]
+    },
+    {
+      "parameters": {
+        "resource": "channel",
+        "operation": "history",
+        "channelId": {
+          "__rl": true,
+          "mode": "list",
+          "value": ""
+        },
+        "limit": 10,
+        "filters": {}
+      },
+      "id": "slack-get-alerts",
+      "name": "Get Slack Alerts",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.3,
+      "position": [220, 300],
+      "credentials": {
+        "slackApi": {
+          "id": "",
+          "name": "Slack - POC"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Extract alert fields from Slack messages and filter unprocessed alerts\nconst alerts = [];\n\nfor (const item of $input.all()) {\n  const msg = item.json;\n  const text = msg.text || '';\n\n  // Skip non-alert messages (look for a splunk link/reference)\n  if (!text.toLowerCase().includes('splunk') && !text.toLowerCase().includes('alert')) {\n    continue;\n  }\n\n  // Extract fields from the Slack message\n  const splunkMatch = text.match(/splunk[^\\s]*(https?:\\/\\/[^\\s]+|[A-Z_]+\\d+)/i);\n  const severityMatch = text.match(/severity\\s*[:=]\\s*(critical|high|medium|low)/i);\n  const serviceMatch = text.match(/service\\s*[:=]\\s*([\\w-]+)/i);\n\n  alerts.push({\n    json: {\n      alert_id: msg.ts || `alert-${Date.now()}`,\n      timestamp: msg.ts ? new Date(parseFloat(msg.ts) * 1000).toISOString() : new Date().toISOString(),\n      source_service: serviceMatch ? serviceMatch[1] : 'unknown',\n      severity: severityMatch ? severityMatch[1].toUpperCase() : 'MEDIUM',\n      splunk_query_or_link: splunkMatch ? splunkMatch[1] : text,\n      slack_channel: msg.channel || '',\n      slack_thread_ts: msg.ts || '',\n      raw_text: text\n    }\n  });\n}\n\nif (alerts.length === 0) {\n  alerts.push({ json: { _skip: true } });\n}\n\nreturn alerts;"
+      },
+      "id": "code-parse-alerts",
+      "name": "Parse Alert Fields",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [440, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "" },
+          "conditions": [
+            {
+              "id": "skip-check",
+              "leftValue": "={{ $json._skip }}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "notTrue" }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "filter-skip",
+      "name": "Has Alerts?",
+      "type": "n8n-nodes-base.filter",
+      "typeVersion": 2.2,
+      "position": [660, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// MOCK: Simulate Splunk log retrieval\n// In production, replace with HTTP Request to Splunk API\nconst alert = $input.first().json;\n\nreturn [{\n  json: {\n    ...alert,\n    splunk_result: {\n      error_signature: `ERR_${alert.source_service.toUpperCase()}_${Date.now().toString(36).slice(-4).toUpperCase()}`,\n      error_message: `Simulated error from ${alert.source_service}: connection timeout after 30s`,\n      stack_trace_or_log_excerpt: `[${alert.timestamp}] ERROR ${alert.source_service} - TimeoutException: upstream service did not respond within 30000ms\\n  at HttpClient.request (client.js:142)\\n  at PaymentService.process (payment.js:87)`,\n      affected_service: alert.source_service,\n      first_seen: alert.timestamp,\n      last_seen: alert.timestamp,\n      occurrence_count: Math.floor(Math.random() * 50) + 1\n    }\n  }\n}];"
+      },
+      "id": "code-mock-splunk",
+      "name": "Fetch Splunk Logs (Mock)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [880, 300]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "https://api.github.com/repos/gamba/poc-n8n/contents/run-book.md",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Accept", "value": "application/vnd.github.v3.raw" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "http-fetch-runbook",
+      "name": "Fetch Runbook from GitHub",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1100, 300],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "",
+          "name": "GitHub PAT"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse runbook markdown and match against current error\nconst alert = $input.first().json;\nconst runbookRaw = $('Fetch Runbook from GitHub').first().json.data || $('Fetch Runbook from GitHub').first().json;\nconst runbookText = typeof runbookRaw === 'string' ? runbookRaw : JSON.stringify(runbookRaw);\n\n// Parse scenarios from runbook\nconst scenarioBlocks = runbookText.split(/^## /m).filter(b => b.trim());\nconst scenarios = [];\n\nfor (const block of scenarioBlocks) {\n  const idMatch = block.match(/Scenario ID\\s*[:=]\\s*`?([A-Z_]+\\d+)`?/i);\n  const patternMatch = block.match(/Match Pattern\\s*[:=]\\s*`?([^`\\n]+)`?/i);\n  const impactMatch = block.match(/Impact\\s*[:=]\\s*`?([^`\\n]+)`?/i);\n\n  if (idMatch && patternMatch) {\n    scenarios.push({\n      scenario_id: idMatch[1],\n      match_pattern: patternMatch[1].trim(),\n      impact_classification: impactMatch ? impactMatch[1].trim() : 'UNKNOWN',\n      raw_block: block\n    });\n  }\n}\n\n// Match current error against known patterns\nconst errorSig = (alert.splunk_result?.error_message || '').toLowerCase();\nlet bestMatch = null;\nlet confidence = 'NO_MATCH';\n\nfor (const scenario of scenarios) {\n  const pattern = scenario.match_pattern.toLowerCase();\n  if (errorSig.includes(pattern) || pattern.includes(errorSig.split(':')[0]?.trim())) {\n    bestMatch = scenario;\n    confidence = 'MATCHED';\n    break;\n  }\n}\n\n// Check for partial/low confidence match\nif (!bestMatch) {\n  for (const scenario of scenarios) {\n    const keywords = scenario.match_pattern.toLowerCase().split(/[\\s_]+/);\n    const matchCount = keywords.filter(kw => kw.length > 3 && errorSig.includes(kw)).length;\n    if (matchCount >= 2) {\n      bestMatch = scenario;\n      confidence = 'MATCH_LOW_CONFIDENCE';\n      break;\n    }\n  }\n}\n\nreturn [{\n  json: {\n    ...alert,\n    match_result: confidence,\n    matched_scenario: bestMatch,\n    total_scenarios_checked: scenarios.length\n  }\n}];"
+      },
+      "id": "code-match-scenario",
+      "name": "Match Runbook Scenario",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1320, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "" },
+          "conditions": [
+            {
+              "id": "match-check",
+              "leftValue": "={{ $json.match_result }}",
+              "rightValue": "MATCHED",
+              "operator": { "type": "string", "operation": "equals" }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "if-matched",
+      "name": "Scenario Matched?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [1540, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Execute matched runbook action (log only for POC - no destructive actions)\nconst data = $input.first().json;\nconst scenario = data.matched_scenario;\n\nreturn [{\n  json: {\n    action: 'RUNBOOK_EXECUTED',\n    scenario_id: scenario.scenario_id,\n    alert_id: data.alert_id,\n    message: `Matched scenario ${scenario.scenario_id}. Remediation steps would be executed here (POC: logged only).`,\n    impact_classification: scenario.impact_classification,\n    severity: data.severity,\n    timestamp: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "code-execute-runbook",
+      "name": "Execute Runbook (Log)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1800, 100]
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "mode": "list",
+          "value": ""
+        },
+        "text": "=:white_check_mark: *Runbook Match Found*\n• Scenario: `{{ $json.scenario_id }}`\n• Alert: `{{ $json.alert_id }}`\n• Action: {{ $json.message }}",
+        "otherOptions": {}
+      },
+      "id": "slack-reply-matched",
+      "name": "Slack: Matched Result",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.3,
+      "position": [2020, 100],
+      "credentials": {
+        "slackApi": {
+          "id": "",
+          "name": "Slack - POC"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Generate a proposed new scenario from unmatched logs\nconst data = $input.first().json;\nconst splunk = data.splunk_result || {};\nconst ts = new Date().toISOString().slice(0, 10);\nconst scenarioId = `NEW_${splunk.affected_service?.toUpperCase() || 'SVC'}_${Date.now().toString(36).slice(-3).toUpperCase()}`;\n\nconst newScenario = `## ${scenarioId}: ${splunk.error_message || 'Unknown error'}\\n\\n` +\n  `| Field | Value |\\n|---|---|\\n` +\n  `| Scenario ID | \\`${scenarioId}\\` |\\n` +\n  `| Title | ${splunk.error_message || 'New scenario'} |\\n` +\n  `| Match Pattern | \\`${splunk.error_signature || 'TBD'}\\` |\\n` +\n  `| Impact | \\`USER_IMPACTING\\` |\\n` +\n  `| Remediation Steps | TODO: Define remediation |\\n` +\n  `| Rollback Steps | TODO: Define rollback |\\n` +\n  `| Owner Team | TODO: Assign |\\n` +\n  `| Last Reviewed | ${ts} |\\n`;\n\nreturn [{\n  json: {\n    ...data,\n    new_scenario_id: scenarioId,\n    new_scenario_md: newScenario,\n    branch_name: `incident/${scenarioId.toLowerCase()}`,\n    pr_title: `[Auto] New runbook scenario: ${scenarioId}`,\n    pr_body: `Automated PR from incident triage workflow.\\n\\nAlert ID: ${data.alert_id}\\nError: ${splunk.error_message}\\nService: ${splunk.affected_service}\\nOccurrences: ${splunk.occurrence_count}`\n  }\n}];"
+      },
+      "id": "code-gen-scenario",
+      "name": "Generate New Scenario",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1800, 500]
+    },
+    {
+      "parameters": {
+        "method": "PUT",
+        "url": "=https://api.github.com/repos/gamba/poc-n8n/contents/run-book.md",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Accept", "value": "application/vnd.github.v3+json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"message\": \"Add scenario {{ $json.new_scenario_id }}\",\n  \"branch\": \"{{ $json.branch_name }}\",\n  \"content\": \"NOTE: In production, base64-encode the updated runbook content here\"\n}",
+        "options": {}
+      },
+      "id": "http-create-pr",
+      "name": "Create GitHub PR",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2020, 500],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "",
+          "name": "GitHub PAT"
+        }
+      },
+      "notes": "POC placeholder: In production, this uses multiple GitHub API calls to (1) create branch, (2) update file, (3) create PR. For the POC, this node shows the intent. Wire up the full 3-step flow when GitHub PAT is configured."
+    },
+    {
+      "parameters": {
+        "resource": "issue",
+        "operation": "create",
+        "project": {
+          "__rl": true,
+          "mode": "list",
+          "value": ""
+        },
+        "summary": "={{ $json.pr_title }}",
+        "issueType": {
+          "__rl": true,
+          "mode": "list",
+          "value": ""
+        },
+        "additionalFields": {
+          "description": "=Automated Jira ticket from incident triage.\n\n*Alert ID:* {{ $json.alert_id }}\n*Error Signature:* {{ $json.splunk_result.error_signature }}\n*Service:* {{ $json.splunk_result.affected_service }}\n*Severity:* {{ $json.severity }}\n*PR:* {{ $json.branch_name }}\n*Occurrences:* {{ $json.splunk_result.occurrence_count }}\n\n---\nSuggested scenario:\n{{ $json.new_scenario_md }}"
+        }
+      },
+      "id": "jira-create-ticket",
+      "name": "Create Jira Ticket",
+      "type": "n8n-nodes-base.jira",
+      "typeVersion": 1,
+      "position": [2240, 500],
+      "credentials": {
+        "jiraSoftwareCloudApi": {
+          "id": "",
+          "name": "Jira - POC"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "" },
+          "conditions": [
+            {
+              "id": "impact-check",
+              "leftValue": "={{ $json.severity }}",
+              "rightValue": "HIGH",
+              "operator": { "type": "string", "operation": "equals" }
+            },
+            {
+              "id": "impact-check-critical",
+              "leftValue": "={{ $json.severity }}",
+              "rightValue": "CRITICAL",
+              "operator": { "type": "string", "operation": "equals" }
+            }
+          ],
+          "combinator": "or"
+        }
+      },
+      "id": "if-send-email",
+      "name": "Severity High/Critical?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [2460, 500]
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "mode": "list",
+          "value": ""
+        },
+        "text": "=:rotating_light: *New Incident - No Runbook Match*\n• Scenario: `{{ $json.new_scenario_id }}`\n• Service: `{{ $json.splunk_result.affected_service }}`\n• Error: {{ $json.splunk_result.error_message }}\n• Severity: `{{ $json.severity }}`\n• Branch: `{{ $json.branch_name }}`\n• :email: *On-call notified* (severity {{ $json.severity }})",
+        "otherOptions": {}
+      },
+      "id": "slack-notify-high",
+      "name": "Slack: Notify (High Severity)",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.3,
+      "position": [2700, 400],
+      "credentials": {
+        "slackApi": {
+          "id": "",
+          "name": "Slack - POC"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "mode": "list",
+          "value": ""
+        },
+        "text": "=:warning: *New Incident - No Runbook Match*\n• Scenario: `{{ $json.new_scenario_id }}`\n• Service: `{{ $json.splunk_result.affected_service }}`\n• Error: {{ $json.splunk_result.error_message }}\n• Severity: `{{ $json.severity }}`\n• Branch: `{{ $json.branch_name }}`\n• Jira ticket created. No email (non-critical).",
+        "otherOptions": {}
+      },
+      "id": "slack-notify-low",
+      "name": "Slack: Notify (Low Severity)",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.3,
+      "position": [2700, 600],
+      "credentials": {
+        "slackApi": {
+          "id": "",
+          "name": "Slack - POC"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Every 5 Minutes": {
+      "main": [[{ "node": "Get Slack Alerts", "type": "main", "index": 0 }]]
+    },
+    "Get Slack Alerts": {
+      "main": [[{ "node": "Parse Alert Fields", "type": "main", "index": 0 }]]
+    },
+    "Parse Alert Fields": {
+      "main": [[{ "node": "Has Alerts?", "type": "main", "index": 0 }]]
+    },
+    "Has Alerts?": {
+      "main": [[{ "node": "Fetch Splunk Logs (Mock)", "type": "main", "index": 0 }]]
+    },
+    "Fetch Splunk Logs (Mock)": {
+      "main": [[{ "node": "Fetch Runbook from GitHub", "type": "main", "index": 0 }]]
+    },
+    "Fetch Runbook from GitHub": {
+      "main": [[{ "node": "Match Runbook Scenario", "type": "main", "index": 0 }]]
+    },
+    "Match Runbook Scenario": {
+      "main": [[{ "node": "Scenario Matched?", "type": "main", "index": 0 }]]
+    },
+    "Scenario Matched?": {
+      "main": [
+        [{ "node": "Execute Runbook (Log)", "type": "main", "index": 0 }],
+        [{ "node": "Generate New Scenario", "type": "main", "index": 0 }]
+      ]
+    },
+    "Execute Runbook (Log)": {
+      "main": [[{ "node": "Slack: Matched Result", "type": "main", "index": 0 }]]
+    },
+    "Generate New Scenario": {
+      "main": [[{ "node": "Create GitHub PR", "type": "main", "index": 0 }]]
+    },
+    "Create GitHub PR": {
+      "main": [[{ "node": "Create Jira Ticket", "type": "main", "index": 0 }]]
+    },
+    "Create Jira Ticket": {
+      "main": [[{ "node": "Severity High/Critical?", "type": "main", "index": 0 }]]
+    },
+    "Severity High/Critical?": {
+      "main": [
+        [{ "node": "Slack: Notify (High Severity)", "type": "main", "index": 0 }],
+        [{ "node": "Slack: Notify (Low Severity)", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "tags": [{ "name": "incident-triage" }, { "name": "poc" }]
+}

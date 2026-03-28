@@ -1,0 +1,12 @@
+# Secrets – never commit this file
+.env
+not-to-commit.md
+
+# n8n data
+n8n_data/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+*~
